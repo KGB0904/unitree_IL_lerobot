@@ -27,7 +27,7 @@ The purpose of this project is to use the [LeRobot](https://github.com/huggingfa
 
 ```bash
 # Clone the source code
-git clone --recurse-submodules https://github.com/unitreerobotics/unitree_IL_lerobot.git
+git clone --recurse-submodules https://github.com/CILAB-ROBOTICS/unitree_IL_lerobot.git
 
 # If already downloaded:
 git submodule update --init --recursive
