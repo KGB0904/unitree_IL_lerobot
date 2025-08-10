@@ -54,8 +54,9 @@ class JsonDataset:
         assert data_dirs is not None, "Data directory cannot be None"
         assert robot_type is not None, "Robot type cannot be None"
         self.data_dirs = data_dirs
+        self.robot_type = robot_type
         self.json_file = 'data.json'
-        
+
         # Initialize paths and cache
         self._init_paths()
         self._init_cache()
@@ -155,6 +156,44 @@ class JsonDataset:
         return images
 
 
+    def _parse_tactiles(self, episode_path, episode_data: Dict) -> dict[str, list[np.ndarray]]:
+        """Load and stack tactile data from the episode."""
+
+        tactiles = defaultdict(list)
+
+        keys = episode_data["data"][0]['tactiles'].keys()
+
+        for key in keys:
+            for sample_data in episode_data['data']:
+                relative_path = sample_data['tactiles'].get(key)
+                if not relative_path:
+                    continue
+
+                tactile_path = os.path.join(episode_path, relative_path)
+                if not os.path.exists(tactile_path):
+                    raise FileNotFoundError(f"Tactile path does not exist: {tactile_path}")
+
+                tactile_data = np.load(tactile_path)
+                if tactile_data is None:
+                    raise RuntimeError(f"Failed to load tactile data: {tactile_path}")
+
+                # Hard coded shape for G1-Inspire
+                prefix = key.split('_')[0]
+                sub_keys = ROBOT_CONFIGS[self.robot_type].tactile_to_image_shape
+                idx = 0
+                for sub_key, (channel, height, width) in sub_keys.items():
+                    if sub_key.startswith(prefix):
+                        size = height * width
+                        data = tactile_data[idx:idx+size].reshape((1, height, width))
+                        normalized_data = (data / 4095).astype(np.float32)  # Normalize to [0, 1]
+                        transposed_data = normalized_data.transpose(1, 2, 0)  # (H, W, C) format
+                        image_rgb = cv2.cvtColor(transposed_data, cv2.COLOR_GRAY2RGB)
+                        tactiles[sub_key].append(image_rgb)
+                        idx += size
+
+        return tactiles
+
+
     def get_item(self, index: Optional[int] = None,) -> Dict:
         """Get a training sample from the dataset.  """
             
@@ -174,6 +213,9 @@ class JsonDataset:
         # Load camera images
         cameras = self._parse_images(file_path, episode_data)
 
+        # Load tactile data
+        tactiles = self._parse_tactiles(file_path, episode_data)
+
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {
@@ -189,6 +231,7 @@ class JsonDataset:
                 'state': state, 
                 'action': action,
                 'cameras': cameras,
+                'tactiles': tactiles,
                 'task': task,
                 'data_cfg':data_cfg}
 
@@ -244,7 +287,19 @@ def create_empty_dataset(
     for cam in cameras:
         features[f"observation.images.{cam}"] = {
             "dtype": mode,
-            "shape": (3, 480, 640),
+            "shape": (3, 480, 848),  # TODO: check whether hardcoded is required
+            "names": [
+                "channels",
+                "height",
+                "width",
+            ],
+        }
+
+    tactiles = getattr(ROBOT_CONFIGS[robot_type], "tactiles", [])
+    for tactile in tactiles:
+        features[f"observation.images.{tactile}"] = {
+            "dtype": mode,
+            "shape": ROBOT_CONFIGS[robot_type].tactile_to_image_shape[tactile],
             "names": [
                 "channels",
                 "height",
@@ -294,6 +349,9 @@ def populate_dataset(
 
             for camera, img_array in cameras.items():
                 frame[f"observation.images.{camera}"] = img_array[i]
+
+            for tactile, tactile_array in episode["tactiles"].items():
+                frame[f"observation.images.{tactile}"] = tactile_array[i]
 
             dataset.add_frame(frame)
 
