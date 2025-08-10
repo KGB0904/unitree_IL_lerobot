@@ -85,6 +85,7 @@ python lerobot/scripts/visualize_dataset.py \
 ## 2.3 🛠️ 数据转换
 
 使用[avp_teleoperate](https://github.com/unitreerobotics/avp_teleoperate)采集的数据是采用 JSON 格式进行存储。假如采集的数据存放在`$HOME/datasets/task_name` 目录中，格式如下:
+```
 datasets/                               # 数据集文件夹
     └── task_name /                     # 任务名称
         ├── episode_0001                # 第一条轨迹
@@ -95,7 +96,7 @@ datasets/                               # 数据集文件夹
         ├── episode_0002
         ├── episode_...
         ├── episode_xxx
-
+```
 
 ### 2.3.1 🔀 排序和重命名
 

@@ -89,6 +89,7 @@ If you want to record your own dataset. The open-source teleoperation project [a
 ## 2.3 🛠️ Data Conversion
 
 The data collected using [avp_teleoperate](https://github.com/unitreerobotics/avp_teleoperate/tree/g1) is stored in JSON format. Assuming the collected data is stored in the `$HOME/datasets/task_name`, the format is as follows
+```
 datasets/                               # Dataset folder
     └── task_name /                     # Task name
         ├── episode_0001                # First trajectory
@@ -99,6 +100,7 @@ datasets/                               # Dataset folder
         ├── episode_0002
         ├── episode_...
         ├── episode_xxx
+```
 
 ### 2.3.1 🔀 Sort and Rename
 
