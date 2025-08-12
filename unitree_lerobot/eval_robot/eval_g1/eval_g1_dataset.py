@@ -30,6 +30,8 @@ from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_unitree import 
 #from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_inspire import Inspire_Controller
 from unitree_lerobot.eval_robot.eval_g1.eval_real_config import EvalRealConfig
 
+from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+
 
 # copy from lerobot.common.robot_devices.control_utils import predict_action
 def predict_action(observation, policy, device, use_amp):
@@ -71,28 +73,36 @@ def eval_policy(
 
     # send_real_robot: If you want to read observations from the dataset and send them to the real robot, set this to True.  
     # (This helps verify whether the model has generalization ability to the environment, as there are inevitably differences between the real environment and the training data environment.)
-    robot_config = {
+    eval_config = {
         'arm_type': 'g1',
         'hand_type': "inspire",
+        'tactile_enc_type': "image",
         'send_real_robot': False,
     }
+
+    robot_config = ROBOT_CONFIGS[
+        f"Unitree"
+        f"_{eval_config['arm_type'].capitalize()}"
+        f"_{eval_config['hand_type'].capitalize()}"
+    ]
 
     # init pose
     from_idx = dataset.episode_data_index["from"][0].item()
     step = dataset[from_idx]
     to_idx = dataset.episode_data_index["to"][0].item()
 
-    camera_names = ["cam_left_high"]
+    camera_names = robot_config.cameras
+    tactile_names = getattr(robot_config, "tactiles", [])
     ground_truth_actions = []
     predicted_actions = []
 
-    if robot_config['send_real_robot']:
+    if eval_config['send_real_robot']:
         # arm
         arm_ctrl = G1_29_ArmController()
         init_left_arm_pose = step['observation.state'][:14].cpu().numpy()
 
         # hand
-        if robot_config['hand_type'] == "dex3":
+        if eval_config['hand_type'] == "dex3":
             left_hand_array = Array('d', 7, lock = True)          # [input]
             right_hand_array = Array('d', 7, lock = True)         # [input]
             dual_hand_data_lock = Lock()
@@ -102,7 +112,7 @@ def eval_policy(
             init_left_hand_pose = step['observation.state'][14:21].cpu().numpy()
             init_right_hand_pose = step['observation.state'][21:].cpu().numpy()
 
-        elif robot_config['hand_type'] == "gripper":
+        elif eval_config['hand_type'] == "gripper":
             left_hand_array = Array('d', 1, lock=True)             # [input]
             right_hand_array = Array('d', 1, lock=True)            # [input]
             dual_gripper_data_lock = Lock()
@@ -111,7 +121,7 @@ def eval_policy(
             gripper_ctrl = Gripper_Controller(left_hand_array, right_hand_array, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array)
             init_left_hand_pose = step['observation.state'][14].cpu().numpy()
             init_right_hand_pose = step['observation.state'][15].cpu().numpy()
-        elif robot_config['hand_type'] == "inspire":
+        elif eval_config['hand_type'] == "inspire":
             left_hand_array = Array('d', 6, lock = True)      # [input]
             right_hand_array = Array('d', 6, lock = True)     # [input]
             dual_hand_data_lock = Lock()
@@ -126,8 +136,8 @@ def eval_policy(
     #===============init robot=====================
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
     if user_input.lower() == 's':
-        
-        if robot_config['send_real_robot']:
+
+        if eval_config['send_real_robot']:
             # "The initial positions of the robot's arm and fingers take the initial positions during data recording."
             print("init robot pose")
             arm_ctrl.ctrl_dual_arm(init_left_arm_pose, np.zeros(14))
@@ -146,6 +156,17 @@ def eval_policy(
             for cam_name in camera_names:
                 observation[f"observation.images.{cam_name}"] = step[f"observation.images.{cam_name}"]
             observation["observation.state"] = step["observation.state"]
+            for tac_name in tactile_names:
+                if eval_config["tactile_enc_type"] == "image":
+                    observation[f"observation.images.{tac_name}"] = step[f"observation.images.{tac_name}"]
+                elif eval_config["tactile_enc_type"] == "state":
+                    observation["observation.state"] = torch.cat(
+                        [
+                            observation["observation.state"],
+                            step[f"observation.state.{tac_name}"].unsqueeze(0),
+                        ],
+                        dim=0,
+                    )
 
             action = predict_action(
                 observation, policy, get_safe_torch_device(policy.config.device), policy.config.use_amp
@@ -156,13 +177,13 @@ def eval_policy(
             ground_truth_actions.append(step["action"].numpy())
             predicted_actions.append(action)
 
-            if robot_config['send_real_robot']:
+            if eval_config['send_real_robot']:
                 # exec action
                 arm_ctrl.ctrl_dual_arm(action[:14], np.zeros(14))
-                if robot_config['hand_type'] == "dex3":
+                if eval_config['hand_type'] == "dex3":
                     left_hand_array[:] = action[14:21]
                     right_hand_array[:] = action[21:]
-                elif robot_config['hand_type'] == "gripper":
+                elif eval_config['hand_type'] == "gripper":
                     left_hand_array[:] = action[14]
                     right_hand_array[:] = action[15]
             
