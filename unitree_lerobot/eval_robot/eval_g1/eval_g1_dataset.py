@@ -27,6 +27,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_arm import G1_29_ArmController
 from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_unitree import Dex3_1_Controller, Gripper_Controller
+#from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_inspire import Inspire_Controller
 from unitree_lerobot.eval_robot.eval_g1.eval_real_config import EvalRealConfig
 
 
@@ -72,7 +73,7 @@ def eval_policy(
     # (This helps verify whether the model has generalization ability to the environment, as there are inevitably differences between the real environment and the training data environment.)
     robot_config = {
         'arm_type': 'g1',
-        'hand_type': "dex3",
+        'hand_type': "inspire",
         'send_real_robot': False,
     }
 
@@ -81,7 +82,7 @@ def eval_policy(
     step = dataset[from_idx]
     to_idx = dataset.episode_data_index["to"][0].item()
 
-    camera_names = ["cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist"]
+    camera_names = ["cam_left_high"]
     ground_truth_actions = []
     predicted_actions = []
 
@@ -110,6 +111,15 @@ def eval_policy(
             gripper_ctrl = Gripper_Controller(left_hand_array, right_hand_array, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array)
             init_left_hand_pose = step['observation.state'][14].cpu().numpy()
             init_right_hand_pose = step['observation.state'][15].cpu().numpy()
+        elif robot_config['hand_type'] == "inspire":
+            left_hand_array = Array('d', 6, lock = True)      # [input]
+            right_hand_array = Array('d', 6, lock = True)     # [input]
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
+            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+            hand_ctrl = Inspire_Controller(left_hand_array, right_hand_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array)
+            init_left_hand_pose = step['observation.state'][14:20].cpu().numpy()
+            init_right_hand_pose = step['observation.state'][20:].cpu().numpy()
         else:
             pass
 
