@@ -28,6 +28,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from unitree_lerobot.eval_robot.eval_g1.image_server.image_client import ImageClient
 from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_arm import G1_29_ArmController
 from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_unitree import Dex3_1_Controller, Gripper_Controller
+from unitree_lerobot.eval_robot.eval_g1.robot_control.robot_hand_inspire import Inspire_Controller
 from unitree_lerobot.eval_robot.eval_g1.eval_real_config import EvalRealConfig
 
 
@@ -63,7 +64,7 @@ def eval_policy(
     policy: torch.nn.Module,
     dataset: LeRobotDataset,
 ):
-    
+
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
     device = get_device_from_parameters(policy)
 
@@ -74,11 +75,8 @@ def eval_policy(
     img_config = {
         'fps': 30,
         'head_camera_type': 'opencv',
-        'head_camera_image_shape': [480, 1280],  # Head camera resolution
-        'head_camera_id_numbers': [0],
-        'wrist_camera_type': 'opencv',
-        'wrist_camera_image_shape': [480, 640],  # Wrist camera resolution
-        'wrist_camera_id_numbers': [2, 4],
+        'head_camera_image_shape': [480, 848],  # Head camera resolution
+        'head_camera_id_numbers': [0]
     }
     ASPECT_RATIO_THRESHOLD = 2.0 # If the aspect ratio exceeds this value, it is considered binocular
     if len(img_config['head_camera_id_numbers']) > 1 or (img_config['head_camera_image_shape'][1] / img_config['head_camera_image_shape'][0] > ASPECT_RATIO_THRESHOLD):
@@ -89,7 +87,7 @@ def eval_policy(
         WRIST = True
     else:
         WRIST = False
-    
+
     if BINOCULAR and not (img_config['head_camera_image_shape'][1] / img_config['head_camera_image_shape'][0] > ASPECT_RATIO_THRESHOLD):
         tv_img_shape = (img_config['head_camera_image_shape'][0], img_config['head_camera_image_shape'][1] * 2, 3)
     else:
@@ -102,7 +100,7 @@ def eval_policy(
         wrist_img_shape = (img_config['wrist_camera_image_shape'][0], img_config['wrist_camera_image_shape'][1] * 2, 3)
         wrist_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(wrist_img_shape) * np.uint8().itemsize)
         wrist_img_array = np.ndarray(wrist_img_shape, dtype = np.uint8, buffer = wrist_img_shm.buf)
-        img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name, 
+        img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name,
                                  wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name)
     else:
         img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name)
@@ -113,7 +111,7 @@ def eval_policy(
 
     robot_config = {
         'arm_type': 'g1',
-        'hand_type': "dex3",
+        'hand_type': "inspire",
     }
 
     # init pose
@@ -145,6 +143,15 @@ def eval_policy(
         gripper_ctrl = Gripper_Controller(left_hand_array, right_hand_array, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array)
         init_left_hand_pose = step['observation.state'][14].cpu().numpy()
         init_right_hand_pose = step['observation.state'][15].cpu().numpy()
+    elif robot_config['hand_type'] == "inspire":
+        left_hand_array = Array('d', 6, lock = True)      # [input]
+        right_hand_array = Array('d', 6, lock = True)     # [input]
+        dual_hand_data_lock = Lock()
+        dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
+        dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+        hand_ctrl = Inspire_Controller(left_hand_array, right_hand_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array)
+        init_left_hand_pose = step['observation.state'][14:20].cpu().numpy()
+        init_right_hand_pose = step['observation.state'][20:].cpu().numpy()
     else:
         pass
 
@@ -178,10 +185,11 @@ def eval_policy(
             )
 
             observation = {
-                "observation.images.cam_left_high": torch.from_numpy(left_top_camera),
-                "observation.images.cam_right_high": torch.from_numpy(right_top_camera) if BINOCULAR else None,
-                "observation.images.cam_left_wrist": torch.from_numpy(left_wrist_camera) if WRIST else None,
-                "observation.images.cam_right_wrist": torch.from_numpy(right_wrist_camera) if WRIST else None,
+                "observation.images.cam_left_high": torch.from_numpy(left_top_camera)
+                # "observation.images.cam_left_high": torch.from_numpy(left_top_camera),
+                # "observation.images.cam_right_high": torch.from_numpy(right_top_camera) if BINOCULAR else None,
+                # "observation.images.cam_left_wrist": torch.from_numpy(left_wrist_camera) if WRIST else None,
+                # "observation.images.cam_right_wrist": torch.from_numpy(right_wrist_camera) if WRIST else None,
             }
 
             # get current state data.
@@ -195,7 +203,11 @@ def eval_policy(
                 with dual_gripper_data_lock:
                     left_hand_state = [dual_gripper_state_array[1]]
                     right_hand_state = [dual_gripper_state_array[0]]
-            
+            elif robot_config['hand_type'] == "inspire":
+                with dual_hand_data_lock:
+                    left_hand_state = dual_hand_state_array[:6]
+                    right_hand_state = dual_hand_state_array[-6:]
+
             observation["observation.state"] = torch.from_numpy(np.concatenate((current_lr_arm_q, left_hand_state, right_hand_state), axis=0)).float()
 
             observation = {
@@ -215,6 +227,9 @@ def eval_policy(
             elif robot_config['hand_type'] == "gripper":
                 left_hand_array[:] = action[14]
                 right_hand_array[:] = action[15]
+            elif robot_config['hand_type'] == "inspire":
+                left_hand_array[:] = action[14:20]
+                right_hand_array[:] = action[20:]
         
             time.sleep(1/frequency)
 
