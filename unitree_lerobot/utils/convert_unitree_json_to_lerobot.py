@@ -73,7 +73,7 @@ class JsonDataset:
         
         for task_path in glob.glob(os.path.join(self.data_dirs, '*')):
             if os.path.isdir(task_path):
-                episode_paths = glob.glob(os.path.join(task_path, '*'))
+                episode_paths = glob.glob(os.path.join(task_path))
                 if episode_paths:
                     self.task_paths.append(task_path)
                     self.episode_paths.extend(episode_paths)
@@ -284,21 +284,34 @@ def create_empty_dataset(
             ],
         }
 
+    print("cameras", cameras)
     for cam in cameras:
-        features[f"observation.images.{cam}"] = {
-            "dtype": mode,
-            "shape": (3, 480, 848),  # TODO: check whether hardcoded is required
-            "names": [
-                "channels",
-                "height",
-                "width",
-            ],
-        }
+        if cam == 0:
+            features[f"observation.images.{cam}"] = {
+                "dtype": mode,
+                "shape": (3, 480, 848),  # TODO: check whether hardcoded is required
+                "names": [
+                    "channels",
+                    "height",
+                    "width",
+                ],
+            }
+
+        if cam == 3:
+            features[f"observation.images.{cam}"] = {
+                "dtype": mode,
+                "shape": (3, 480, 640),  # TODO: check whether hardcoded is required
+                "names": [
+                    "channels",
+                    "height",
+                    "width",
+                ],
+            }
 
     tactiles = getattr(ROBOT_CONFIGS[robot_type], "tactiles", [])
     for tactile in tactiles:
         features[f"observation.images.{tactile}"] = {
-            "dtype": mode,
+            "dtype": "image",
             "shape": ROBOT_CONFIGS[robot_type].tactile_to_image_shape[tactile],
             "names": [
                 "channels",
@@ -322,6 +335,15 @@ def create_empty_dataset(
         video_backend=dataset_config.video_backend,
     )
 
+def expand_to_26(vec: np.ndarray) -> np.ndarray: # mod
+    """Expand a 1D array of shape (14,) to (26,) by zero-padding."""
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr.shape[0] == 26:
+        return arr
+    if arr.shape[0] > 26:
+        raise ValueError(f"Too many DoFs: got {arr.shape[0]}, expected 26")
+    pad_len = 26 - arr.shape[0]
+    return np.concatenate([arr, np.zeros(pad_len, dtype=arr.dtype)], axis=0)
 
 def populate_dataset(
     dataset: LeRobotDataset,
@@ -340,10 +362,11 @@ def populate_dataset(
         episode_length = episode["episode_length"]
 
         num_frames = episode_length
+
         for i in range(num_frames):
             frame = {
-                "observation.state": state[i],
-                "action": action[i],
+                "observation.state": expand_to_26(state[i]), # mod
+                "action": expand_to_26(action[i]),
                 "task": task
             }
 
