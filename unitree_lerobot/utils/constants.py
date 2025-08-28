@@ -170,7 +170,7 @@ G1_INSPIRE_CONFIG = TactileRobotConfig(
         "kRightHandThumbRotation",
     ],
     cameras=[
-        "cam_left_high",
+        "cam_left_high", "cam_third"
     ],
     tactiles=[
         "left_tactile_little_finger_tip",  # 3*3
@@ -244,7 +244,7 @@ G1_INSPIRE_CONFIG = TactileRobotConfig(
         "right_tactile_thumb_pad": (3, 12, 8),
         "right_tactile_palm": (3, 8, 14),
     }),
-    camera_to_image_key = {'color_0': 'cam_left_high'},
+    camera_to_image_key = {'color_0': 'cam_left_high', 'color_3':'cam_third',},
     json_state_data_name = ['left_arm', 'right_arm', 'left_hand', 'right_hand'],
     json_action_data_name = ['left_arm', 'right_arm', 'left_hand', 'right_hand']
 )

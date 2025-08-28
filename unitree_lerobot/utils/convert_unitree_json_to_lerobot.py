@@ -286,7 +286,7 @@ def create_empty_dataset(
 
     print("cameras", cameras)
     for cam in cameras:
-        if cam == 0:
+        if cam == 'cam_left_high':
             features[f"observation.images.{cam}"] = {
                 "dtype": mode,
                 "shape": (3, 480, 848),  # TODO: check whether hardcoded is required
@@ -297,7 +297,7 @@ def create_empty_dataset(
                 ],
             }
 
-        if cam == 3:
+        if cam == 'cam_third':
             features[f"observation.images.{cam}"] = {
                 "dtype": mode,
                 "shape": (3, 480, 640),  # TODO: check whether hardcoded is required
@@ -335,16 +335,6 @@ def create_empty_dataset(
         video_backend=dataset_config.video_backend,
     )
 
-def expand_to_26(vec: np.ndarray) -> np.ndarray: # mod
-    """Expand a 1D array of shape (14,) to (26,) by zero-padding."""
-    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if arr.shape[0] == 26:
-        return arr
-    if arr.shape[0] > 26:
-        raise ValueError(f"Too many DoFs: got {arr.shape[0]}, expected 26")
-    pad_len = 26 - arr.shape[0]
-    return np.concatenate([arr, np.zeros(pad_len, dtype=arr.dtype)], axis=0)
-
 def populate_dataset(
     dataset: LeRobotDataset,
     raw_dir: Path,
@@ -365,8 +355,8 @@ def populate_dataset(
 
         for i in range(num_frames):
             frame = {
-                "observation.state": expand_to_26(state[i]), # mod
-                "action": expand_to_26(action[i]),
+                "observation.state": state[i], # mod
+                "action": action[i],
                 "task": task
             }
 
