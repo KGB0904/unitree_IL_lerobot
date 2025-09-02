@@ -225,8 +225,9 @@ class MLP(nn.Module):
         # 1. CNN Backbone for image feature extraction (like ACT)
         if self.config.image_features:
             print("Setting up CNN backbone for image feature extraction...")
-            backbone_model = getattr(torchvision.models, "resnet18")(
-                weights="ResNet18_Weights.IMAGENET1K_V1",
+            # Use config values instead of hardcoded ones
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})

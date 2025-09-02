@@ -106,10 +106,9 @@ class MLPConfig(PreTrainedConfig):
     input_features: dict[str, PolicyFeature] = field(default_factory=dict)
     output_features: dict[str, PolicyFeature] = field(default_factory=dict)
 
-    # Image processing settings (like ACT)
+    # Image processing settings (now properly used)
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
-    use_group_norm: bool = True  # Whether to replace batch normalization with group normalization in the backbone
 
     # VAE settings (like ACT)
     use_vae: bool = True  # Whether to use VAE encoder
@@ -117,15 +116,13 @@ class MLPConfig(PreTrainedConfig):
     kl_weight: float = 10.0  # Weight for KL divergence loss
 
     # MLP architecture settings
-    dim_model: int = 512          # Hidden layer dimension
-    n_encoder_layers: int = 4     # Number of hidden layers
-    dropout: float = 0.1          # Dropout rate
+    dim_model: int = 512          # Hidden layer dimension for MLP layers
+    dropout: float = 0.1          # Dropout rate for MLP layers
 
     # Training settings
     optimizer_lr: float = 1e-5                    # Base learning rate
     optimizer_weight_decay: float = 1e-4          # Weight decay
-    optimizer_lr_backbone: float = 1e-5           # Backbone learning rate (currently same as base)
-    use_amp: bool = False                         # Whether to use automatic mixed precision
+    optimizer_lr_backbone: float = 1e-5           # Backbone learning rate (used in get_optim_params)
 
     def __post_init__(self):
         """Validate configuration after initialization"""
