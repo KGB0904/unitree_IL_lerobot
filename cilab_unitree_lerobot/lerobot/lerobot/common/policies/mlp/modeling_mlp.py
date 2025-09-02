@@ -116,24 +116,40 @@ class MLPPolicy(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        # Return parameters in the same format as ACT for compatibility
-        return [
+        # Return parameters with separate learning rates for camera and tactile backbones
+        param_groups = [
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
+                    if not (n.startswith("model.camera_backbone") or n.startswith("model.tactile_backbone") or n.startswith("model.camera_projection")) and p.requires_grad
                 ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
-                ],
-                "lr": self.config.optimizer_lr_backbone,
-            },
+            }
         ]
+        
+        # Add camera backbone group only if camera backbone exists
+        camera_params = [
+            p for n, p in self.named_parameters()
+            if (n.startswith("model.camera_backbone") or n.startswith("model.camera_projection")) and p.requires_grad
+        ]
+        if camera_params:
+            param_groups.append({
+                "params": camera_params,
+                "lr": self.config.optimizer_lr_backbone,
+            })
+        
+        # Add tactile backbone group only if tactile backbone exists
+        tactile_params = [
+            p for n, p in self.named_parameters()
+            if n.startswith("model.tactile_backbone") and p.requires_grad
+        ]
+        if tactile_params:
+            param_groups.append({
+                "params": tactile_params,
+                "lr": self.config.optimizer_lr_backbone,  # Same lr as camera for now
+            })
+        
+        return param_groups
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -222,22 +238,62 @@ class MLP(nn.Module):
         print(f"Config input_features keys: {list(config.input_features.keys())}")
         print(f"Config output_features keys: {list(config.output_features.keys())}")
         
-        # 1. CNN Backbone for image feature extraction (like ACT)
+        # 1. Separate Camera and Tactile Processing
         if self.config.image_features:
-            print("Setting up CNN backbone for image feature extraction...")
-            # Use config values instead of hardcoded ones
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            print("Setting up separate Camera and Tactile networks...")
             
-            # Projection layer for image features (like ACT)
-            self.img_projection = nn.Conv2d(512, config.dim_model, kernel_size=1)
-            print("CNN backbone created successfully!")
+            # Check what types of images we have
+            has_camera = any("tactile" not in key for key in self.config.image_features)
+            has_tactile = any("tactile" in key for key in self.config.image_features)
+            
+            # Camera-specific ResNet backbone (only if we have camera images)
+            if has_camera:
+                print("- Setting up Camera ResNet backbone...")
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.camera_backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+                self.camera_projection = nn.Conv2d(512, config.dim_model, kernel_size=1)
+            else:
+                self.camera_backbone = None
+                self.camera_projection = None
+            
+            # Tactile-specific small CNN (only if we have tactile sensors)
+            if has_tactile:
+                print("- Setting up Tactile CNN network...")
+                self.tactile_backbone = nn.Sequential(
+                    # First conv block
+                    nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((8, 8)),  # Normalize all tactile to 8x8
+                    
+                    # Second conv block
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((4, 4)),  # Further reduce to 4x4
+                    
+                    # Third conv block
+                    nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((2, 2)),  # Final size 2x2
+                    
+                    # Final projection
+                    nn.Conv2d(128, config.dim_model, kernel_size=1),
+                    nn.AdaptiveAvgPool2d((1, 1))  # Global pooling to (dim_model,)
+                )
+            else:
+                self.tactile_backbone = None
+            
+            print(f"Networks created - Camera: {has_camera}, Tactile: {has_tactile}")
         else:
-            print("No images found, backbone not needed")
-            self.backbone = None
+            print("No images found, backbones not needed")
+            self.camera_backbone = None
+            self.tactile_backbone = None
+            self.camera_projection = None
         
         # 2. VAE Encoder (MLP replacement)
         if self.config.use_vae:
@@ -270,8 +326,16 @@ class MLP(nn.Module):
         if self.config.env_state_feature:
             encoder_input_dim += self.config.env_state_feature.shape[0]
         if self.config.image_features:
-            # Global average pooling of image features
-            encoder_input_dim += config.dim_model
+            # Camera features + Tactile features (both dim_model each)
+            has_camera = any("tactile" not in key for key in self.config.image_features)
+            has_tactile = any("tactile" in key for key in self.config.image_features)
+            
+            if has_camera:
+                encoder_input_dim += config.dim_model  # Camera features
+            if has_tactile:
+                encoder_input_dim += config.dim_model  # Tactile features
+            
+            print(f"Image processing - Has camera: {has_camera}, Has tactile: {has_tactile}")
         
         print(f"Encoder input dimension: {encoder_input_dim}")
         
@@ -301,7 +365,8 @@ class MLP(nn.Module):
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
         
         print(f"MLP model created successfully!")
-        print(f"Architecture: Input -> CNN -> VAE Encoder (MLP) -> Transformer (MLP) -> Action Head")
+        print(f"Architecture: Input -> [Camera CNN + Tactile CNN] -> VAE Encoder (MLP) -> Transformer (MLP) -> Action Head")
+        print(f"Final encoder input dimension: {encoder_input_dim}")
 
     def _reset_parameters(self):
         """Initialize MLP parameters (only if not loading from checkpoint)"""
@@ -367,26 +432,48 @@ class MLP(nn.Module):
         if self.config.env_state_feature:
             encoder_inputs.append(batch["observation.environment_state"])
         
-        # 3. Image feature extraction (CNN backbone)
+        # 3. Separate Camera and Tactile feature extraction
         if self.config.image_features:
-            all_img_features = []
+            camera_features = []
+            tactile_features = []
             
-            for img in batch["observation.images"]:
-                # CNN backbone
-                img_features = self.backbone(img)["feature_map"]  # (B, 512, H, W)
-                img_features = self.img_projection(img_features)  # (B, dim_model, H, W)
+            # Separate camera and tactile images based on key names
+            for i, key in enumerate(self.config.image_features):
+                img = batch["observation.images"][i]
                 
-                # Global average pooling
-                img_features = F.adaptive_avg_pool2d(img_features, (1, 1)).squeeze(-1).squeeze(-1)  # (B, dim_model)
-                all_img_features.append(img_features)
+                if "tactile" in key:
+                    # Process tactile sensor with small CNN
+                    if self.tactile_backbone is not None:
+                        tactile_feat = self.tactile_backbone(img)  # (B, dim_model, 1, 1)
+                        tactile_feat = tactile_feat.squeeze(-1).squeeze(-1)  # (B, dim_model)
+                        tactile_features.append(tactile_feat)
+                    else:
+                        raise RuntimeError(f"Tactile backbone not initialized but tactile key found: {key}")
+                else:
+                    # Process camera with ResNet backbone
+                    if self.camera_backbone is not None and self.camera_projection is not None:
+                        camera_feat = self.camera_backbone(img)["feature_map"]  # (B, 512, H, W)
+                        camera_feat = self.camera_projection(camera_feat)  # (B, dim_model, H, W)
+                        camera_feat = F.adaptive_avg_pool2d(camera_feat, (1, 1)).squeeze(-1).squeeze(-1)  # (B, dim_model)
+                        camera_features.append(camera_feat)
+                    else:
+                        raise RuntimeError(f"Camera backbone not initialized but camera key found: {key}")
             
-            # Average across multiple images if any
-            if len(all_img_features) > 1:
-                img_features = torch.stack(all_img_features, dim=0).mean(0)
-            else:
-                img_features = all_img_features[0]
+            # Combine camera features (average if multiple)
+            if camera_features:
+                if len(camera_features) > 1:
+                    combined_camera_feat = torch.stack(camera_features, dim=0).mean(0)
+                else:
+                    combined_camera_feat = camera_features[0]
+                encoder_inputs.append(combined_camera_feat)
             
-            encoder_inputs.append(img_features)
+            # Combine tactile features (average if multiple)
+            if tactile_features:
+                if len(tactile_features) > 1:
+                    combined_tactile_feat = torch.stack(tactile_features, dim=0).mean(0)
+                else:
+                    combined_tactile_feat = tactile_features[0]
+                encoder_inputs.append(combined_tactile_feat)
         
         # 4. Encoder MLP (replaces transformer encoder)
         encoder_input = torch.cat(encoder_inputs, dim=-1)
