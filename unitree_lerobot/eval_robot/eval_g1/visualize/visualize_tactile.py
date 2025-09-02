@@ -72,7 +72,7 @@ def visualize_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
 
         # Load background image for visualization
         bg_img = plt.imread(IMAGE_PATH)
-        cmap = matplotlib.colormaps['viridis']
+        cmap = matplotlib.colormaps['turbo']
         amplifier = 10.0
 
         # Prepare figure
