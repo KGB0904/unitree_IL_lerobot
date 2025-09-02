@@ -194,6 +194,42 @@ class JsonDataset:
         return tactiles
 
 
+    def _parse_external_tactiles(
+        self,
+        episode_path,
+        episode_data: Dict,
+        min_val: float = -300,
+        max_val: float = 1100,
+    ) -> dict[str, list[np.ndarray]]:
+        """Load and stack tactile data from the episode."""
+
+        tactiles = defaultdict(list)
+
+        keys = episode_data["data"][0]['carpet_tactiles'].keys()
+
+        for key in keys:
+            for sample_data in episode_data['data']:
+                relative_path = os.path.basename(sample_data['carpet_tactiles'].get(key))
+                relative_path = os.path.join('carpet_tactiles', relative_path)
+                if not relative_path:
+                    continue
+
+                tactile_path = os.path.join(episode_path, relative_path)
+                if not os.path.exists(tactile_path):
+                    raise FileNotFoundError(f"Tactile path does not exist: {tactile_path}")
+
+                tactile_data = np.load(tactile_path)
+                if tactile_data is None:
+                    raise RuntimeError(f"Failed to load tactile data: {tactile_path}")
+
+                data = tactile_data[None, ...]
+                normalized_data = ((data - min_val) / (max_val - min_val)).astype(np.float32)  # Normalize to [0, 1]
+                transposed_data = normalized_data.transpose(1, 2, 0)  # (H, W, C) format
+                image_rgb = cv2.cvtColor(transposed_data, cv2.COLOR_GRAY2RGB)
+                tactiles[key].append(image_rgb)
+        return tactiles
+
+
     def get_item(self, index: Optional[int] = None,) -> Dict:
         """Get a training sample from the dataset.  """
             
@@ -215,6 +251,10 @@ class JsonDataset:
 
         # Load tactile data
         tactiles = self._parse_tactiles(file_path, episode_data)
+
+        # Load external tactile data if available
+        external_tactiles = self._parse_external_tactiles(file_path, episode_data)
+        tactiles.update(external_tactiles)
 
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
