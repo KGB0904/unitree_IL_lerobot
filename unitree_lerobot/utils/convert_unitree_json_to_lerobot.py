@@ -44,7 +44,7 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 
 class JsonDataset:
-    def __init__(self, data_dirs: Path, robot_type: str) -> None:
+    def __init__(self, data_dirs: Path, robot_type: str, tactile_enc_type: str) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
         
@@ -55,6 +55,7 @@ class JsonDataset:
         assert robot_type is not None, "Robot type cannot be None"
         self.data_dirs = data_dirs
         self.robot_type = robot_type
+        self.tactile_enc_type = tactile_enc_type
         self.json_file = 'data.json'
 
         # Initialize paths and cache
@@ -179,17 +180,32 @@ class JsonDataset:
 
                 # Hard coded shape for G1-Inspire
                 prefix = key.split('_')[0]
-                sub_keys = ROBOT_CONFIGS[self.robot_type].tactile_to_image_shape
-                idx = 0
-                for sub_key, (channel, height, width) in sub_keys.items():
-                    if sub_key.startswith(prefix):
-                        size = height * width
-                        data = tactile_data[idx:idx+size].reshape((1, height, width))
-                        normalized_data = (data / 4095).astype(np.float32)  # Normalize to [0, 1]
-                        transposed_data = normalized_data.transpose(1, 2, 0)  # (H, W, C) format
-                        image_rgb = cv2.cvtColor(transposed_data, cv2.COLOR_GRAY2RGB)
-                        tactiles[sub_key].append(image_rgb)
-                        idx += size
+
+                if self.tactile_enc_type == "image":
+                    sub_keys = ROBOT_CONFIGS[self.robot_type].tactile_to_image_shape
+                    idx = 0
+                    for sub_key, (channel, height, width) in sub_keys.items():
+                        if sub_key.startswith(prefix):
+                            size = height * width
+                            data = tactile_data[idx:idx+size].reshape((1, height, width))
+                            normalized_data = (data / 4095).astype(np.float32)  # Normalize to [0, 1]
+                            transposed_data = normalized_data.transpose(1, 2, 0)  # (H, W, C) format
+                            image_rgb = cv2.cvtColor(transposed_data, cv2.COLOR_GRAY2RGB)
+                            tactiles[sub_key].append(image_rgb)
+                            idx += size
+                elif self.tactile_enc_type == "state":
+                    sub_keys = ROBOT_CONFIGS[self.robot_type].tactile_to_state_indices
+                    state_data = []
+                    for sub_key, indices in sub_keys.items():
+                        if sub_key.startswith(prefix):
+                            indices = np.array(indices)  # (M*N, )
+                            extracted_data = tactile_data[indices]  # (M*N, )
+                            average_value = np.mean(extracted_data)
+                            state_data.append(average_value)
+                    state_data = np.array(state_data, dtype=np.float32)  # (num_sub_keys, )
+                    tactiles[prefix].append(state_data)
+                else:
+                    raise NotImplementedError(f"Tactile encoding type '{self.tactile_enc_type}' is not implemented.")
 
         return tactiles
 
@@ -251,6 +267,14 @@ class JsonDataset:
 
         # Load tactile data
         tactiles = self._parse_tactiles(file_path, episode_data)
+        if self.tactile_enc_type == "state":
+            # Concatenate tactile state data along the last dimension
+            state_tactiles = np.concatenate([
+                tactiles.pop(key) for key in sorted(tactiles.keys())
+            ], axis=-1)
+
+            # Append tactile state data to the original state
+            state = np.concatenate([state, state_tactiles], axis=-1)
 
         # Load external tactile data if available
         external_tactiles = self._parse_external_tactiles(file_path, episode_data)
@@ -279,6 +303,7 @@ class JsonDataset:
 def create_empty_dataset(
     repo_id: str,
     robot_type: str,
+    tactile_enc_type: Literal["image", "state"] = "image",
     mode: Literal["video", "image"] = "video",
     *,
     has_velocity: bool = False,
@@ -349,10 +374,25 @@ def create_empty_dataset(
             }
 
     tactiles = getattr(ROBOT_CONFIGS[robot_type], "tactiles", [])
+    tactile_to_image_shape = getattr(ROBOT_CONFIGS[robot_type], "tactile_to_image_shape", {})
+    if tactile_enc_type == "state":
+        state = features["observation.state"]
+        names = list(ROBOT_CONFIGS[robot_type].tactile_to_state_indices.keys())
+
+        # Modify the state feature to include tactile state names
+        features[f"observation.state"] = {
+            "dtype": "float32",
+            "shape": (state["shape"][0] + len(names),),
+            "names": state["names"] + names,
+        }
+
+        # No need to add tactile images if using state encoding
+        tactiles = ["carpet_0"] if "carpet_0" in tactiles else []  # TODO: check whether hardcoded is required
+
     for tactile in tactiles:
         features[f"observation.images.{tactile}"] = {
             "dtype": "image",
-            "shape": ROBOT_CONFIGS[robot_type].tactile_to_image_shape[tactile],
+            "shape": tactile_to_image_shape[tactile],
             "names": [
                 "channels",
                 "height",
@@ -379,9 +419,10 @@ def populate_dataset(
     dataset: LeRobotDataset,
     raw_dir: Path,
     robot_type: str,
+    tactile_enc_type: Literal["image", "state"] = "image",
 ) -> LeRobotDataset:
 
-    json_dataset = JsonDataset(raw_dir, robot_type)
+    json_dataset = JsonDataset(raw_dir, robot_type, tactile_enc_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
 
@@ -417,6 +458,7 @@ def json_to_lerobot(
     raw_dir: Path,
     repo_id: str,
     robot_type: str,        # Unitree_Z1_Dual, Unitree_G1_Gripper, Unitree_G1_Dex3
+    tactile_enc_type: Literal["image", "state"] = "image",
     *,
     push_to_hub: bool = False,
     mode: Literal["video", "image"] = "video",
@@ -429,6 +471,7 @@ def json_to_lerobot(
     dataset = create_empty_dataset(
         repo_id,
         robot_type=robot_type,
+        tactile_enc_type=tactile_enc_type,
         mode=mode,
         has_effort=False,
         has_velocity=False,
@@ -438,6 +481,7 @@ def json_to_lerobot(
         dataset,
         raw_dir,
         robot_type=robot_type,
+        tactile_enc_type=tactile_enc_type,
     )
 
     if push_to_hub:
@@ -454,3 +498,12 @@ def local_push_to_hub(
 
 if __name__ == "__main__":
     tyro.cli(json_to_lerobot)
+
+"""
+Usage:
+python convert_unitree_json_to_lerobot.py
+--raw-dir <path_to_your_json_dataset> \
+--repo-id <huggingface_repo_id> \
+--robot_type Unitree_G1_Inspire
+--tactile_enc_type state
+"""
