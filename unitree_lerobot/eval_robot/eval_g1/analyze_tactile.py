@@ -21,6 +21,10 @@ import matplotlib.pyplot as plt
 
 import seaborn as sns
 
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
 
 @dataclass
 class AnalysisConfig:
@@ -90,6 +94,117 @@ def plot_tactile_confusion_matrix(tactile_signals_array: dict):
     plt.savefig("tactile_correlation_matrix.png", dpi=300, bbox_inches='tight')
 
 
+def plot_tsne_tactile(
+    data,
+    tactile_names=None,
+    labels=None,
+    fps=None,
+    perplexity=30,
+    standardize=True,
+    pca_dim=None,
+    random_state=42,
+    figsize=(7,7),
+):
+    # 1) Prepare data
+    if isinstance(data, dict):
+        names = tactile_names if tactile_names is not None else sorted(list(data.keys()))
+        cols = []
+        N = None
+        for k in names:
+            v = np.asarray(data[k])
+            if v.ndim == 3:  # (N_STEP, W, H) -> (N_STEP,)
+                v = v.mean(axis=(1, 2))
+            elif v.ndim == 1:  # (N_STEP,)
+                pass
+            else:
+                raise ValueError(f"{k}: expected (N_STEP,W,H) or (N_STEP,), got {v.shape}")
+            if N is None:
+                N = v.shape[0]
+            elif v.shape[0] != N:
+                raise ValueError(f"Time length mismatch at {k}: {v.shape[0]} vs {N}")
+            cols.append(v)
+        X = np.stack(cols, axis=1)  # (N_STEP, N_FEAT)
+        used_names = names
+    else:
+        X = np.asarray(data)
+        if X.ndim != 2:
+            raise ValueError(f"data must be 2D (N_STEP, N_FEAT), got {X.shape}")
+        N = X.shape[0]
+        used_names = [f"feat_{i}" for i in range(X.shape[1])]
+
+    # 2) Fillna
+    # If a column is all NaN, drop it
+    all_nan = np.isnan(X).all(axis=0)
+    if all_nan.any():
+        keep = ~all_nan
+        X = X[:, keep]
+        used_names = [n for n, m in zip(used_names, keep) if m]
+    # Fill NaN with column median
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        if np.isnan(col).any():
+            med = np.nanmedian(col)
+            col[np.isnan(col)] = med
+            X[:, j] = col
+
+    # Standardize
+    if standardize:
+        mu = X.mean(axis=0, keepdims=True)
+        sd = X.std(axis=0, keepdims=True)
+        sd[sd == 0] = 1.0
+        X = (X - mu) / sd
+
+    # 3) PCA (optional)
+    if pca_dim is not None:
+        from sklearn.decomposition import PCA
+        d = int(min(pca_dim, X.shape[1]))
+        if d >= 1:
+            X = PCA(n_components=d, random_state=random_state).fit_transform(X)
+
+    # 4) t-SNE
+    max_perp = max(2, (N - 1) // 3)  # thumb rule
+    perp = min(perplexity, max_perp)
+    if perp < 2:
+        perp = 2
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perp,
+        learning_rate="auto",
+        init="pca",
+        metric="euclidean",
+        random_state=random_state,
+        verbose=0,
+    )
+    Y = tsne.fit_transform(X)  # (N_STEP, 2)
+
+    # 5) Visualize
+    plt.figure(figsize=figsize)
+    if labels is None:
+        t = np.arange(N, dtype=float)
+        if fps and fps > 0:
+            t = t / float(fps)
+            cb_label = "time (s)"
+        else:
+            cb_label = "step"
+        sc = plt.scatter(Y[:, 0], Y[:, 1], c=t, s=10, alpha=0.9)
+        cbar = plt.colorbar(sc)
+        cbar.set_label(cb_label)
+    else:
+        labels = np.asarray(labels)
+        uniq = np.unique(labels)
+        for u in uniq:
+            m = labels == u
+            plt.scatter(Y[m, 0], Y[m, 1], s=12, alpha=0.9, label=str(u))
+        plt.legend(title="label", markerscale=1.5, frameon=True)
+
+    plt.title(f"t-SNE of tactile patches (features={X.shape[1]}, perp={perp})")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.tight_layout()
+    plt.title("Tactile t-SNE Visualization", fontsize=16)
+    plt.savefig("tactile_tsne.png", dpi=300, bbox_inches='tight')
+
+
 def analyze_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
     logging.info("Analyzing tactile data...")
 
@@ -99,7 +214,7 @@ def analyze_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
     from collections import defaultdict
     tactile_signals = defaultdict(list)
 
-    print("Loading tactile data from dataset...")
+    logging.info("Loading tactile data from dataset...")
     if tactile_names:
         for epi_idx in range(dataset.num_episodes):
             # init pose
@@ -138,6 +253,17 @@ def analyze_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
 
     # visualize confusion matrix
     plot_tactile_confusion_matrix(tactile_array_flat)
+
+    # Plot t-SNE
+    # plot_tsne_tactile(
+    #     tactile_array_flat,
+    #     fps=dataset.fps,
+    #     perplexity=35,
+    #     pca_dim=20,
+    #     standardize=True,
+    #     random_state=42,
+    #     figsize=(7, 6),
+    # )
 
     logging.info("End of tactile analysis")
 
