@@ -26,7 +26,7 @@ class VisualizeConfig:
     repo_id: str
     arm_type: str = "g1"
     hand_type: str = "inspire"
-    tactile_enc_type: Literal["image"] = "image"
+    tactile_enc_type: Literal["image", "state"] = "image"
 
 
 def split_vertice(vertices: List[Tuple[int, int]], image_shape: Tuple[int, int, int]):
@@ -58,7 +58,41 @@ def split_vertice(vertices: List[Tuple[int, int]], image_shape: Tuple[int, int, 
     return sub_rects
 
 
-def visualize_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
+def parse_tactile_signals(robot_cfg: RobotConfig, tactile_enc_type: str, step: dict):
+    tactile_signals = {}
+
+    if tactile_enc_type == "image":
+        for tac_name in robot_cfg.tactiles:
+            tactile_img = step.get(f"observation.images.{tac_name}", None)
+            if tactile_img is not None:
+                tactile_signal = tactile_img[0, :, :].numpy()  # (H, W) shape, use first channel
+                tactile_signals[tac_name] = tactile_signal
+
+    elif tactile_enc_type == "state":
+        total_pixels = sum(h * w for c, h, w in robot_cfg.tactile_to_image_shape.values())
+        empty_data = np.zeros((total_pixels,), dtype=np.float32).reshape(2, -1)  # 2 channels -> {left_tactile, right_tactile}
+
+        # Reconstruct raw tactile data from state
+        start_idx = len(robot_cfg.motors)
+        tactile_state = step["observation.state"][start_idx:]
+        for i, (tac_name, pixel_indices) in enumerate(robot_cfg.tactile_to_state_indices.items()):
+            tactile_data = tactile_state[i].item()
+            tac_channel = 0 if tac_name.startswith("left") else 1
+            empty_data[tac_channel, pixel_indices] = tactile_data
+
+        # indexing and reshaping into images
+        flatten_data = empty_data.flatten()
+        idx = 0
+        for tac_name, (channel, height, width) in robot_cfg.tactile_to_image_shape.items():
+            size = height * width
+            tactile_signal = flatten_data[idx:idx + size].reshape((height, width))
+            tactile_signals[tac_name] = tactile_signal
+            idx += size
+
+    return tactile_signals
+
+
+def visualize_tactile(robot_cfg: RobotConfig, tactile_enc_type: str, dataset: LeRobotDataset):
     logging.info("Visualizing tactile data...")
 
     camera_names = robot_cfg.cameras
@@ -127,30 +161,24 @@ def visualize_tactile(robot_cfg: RobotConfig, dataset: LeRobotDataset):
 
             for step_idx in tqdm.tqdm(range(from_idx, to_idx)):
                 step = dataset[step_idx]
+                tactile_signals = parse_tactile_signals(robot_cfg, tactile_enc_type, step)
 
                 # Process tactile data
                 for tac_name in tactile_names:
-                    # Case where tactile data is stored as images
-                    tactile_img = step.get(f"observation.images.{tac_name}", None)
-                    if tactile_img is not None:
-                        tactile_data = tactile_img[0]
+                    tactile_data = tactile_signals[tac_name]
 
-                        # Set value of heatmap
-                        for r in range(tactile_data.shape[0]):
-                            for c in range(tactile_data.shape[1]):
-                                intensity = tactile_data[r, c].item()
-                                color = cmap(intensity * amplifier)
-                                if tac_name.endswith("_tactile_palm"):
-                                    idx = tactile_data.shape[1] * r + c
-                                    new_c = idx // tactile_data.shape[0]
-                                    new_r = tactile_data.shape[0] - (idx - new_c * tactile_data.shape[0]) - 1
-                                    patches[tac_name][new_r][new_c].set_facecolor(color)
-                                else:
-                                    patches[tac_name][r][c].set_facecolor(color)
-                    else:
-                        for r in range(len(patches[tac_name])):
-                            for c in range(len(patches[tac_name][0])):
-                                patches[tac_name][r][c].set_facecolor(cmap(0.0))
+                    # Set value of heatmap
+                    for r in range(tactile_data.shape[0]):
+                        for c in range(tactile_data.shape[1]):
+                            intensity = tactile_data[r, c].item()
+                            color = cmap(intensity * amplifier)
+                            if tac_name.endswith("_tactile_palm"):
+                                idx = tactile_data.shape[1] * r + c
+                                new_c = idx // tactile_data.shape[0]
+                                new_r = tactile_data.shape[0] - (idx - new_c * tactile_data.shape[0]) - 1
+                                patches[tac_name][new_r][new_c].set_facecolor(color)
+                            else:
+                                patches[tac_name][r][c].set_facecolor(color)
 
                 # Process image data if needed
                 for cam_name in camera_names:
@@ -181,7 +209,7 @@ def visualize_main(cfg: VisualizeConfig):
     ]
 
     # Analyze tactile data
-    visualize_tactile(robot_config, dataset)
+    visualize_tactile(robot_config, cfg.tactile_enc_type, dataset)
 
     logging.info("End of analysis")
 
