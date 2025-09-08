@@ -58,36 +58,46 @@ def split_vertice(vertices: List[Tuple[int, int]], image_shape: Tuple[int, int, 
     return sub_rects
 
 
-def parse_tactile_signals(robot_cfg: RobotConfig, tactile_enc_type: str, step: dict):
+def parse_tactile_signals(
+    robot_cfg: RobotConfig,
+    tactile_enc_type: str,
+    step: dict,
+    prefixs: List[str] = ["left_tactile", "right_tactile"],
+):
     tactile_signals = {}
 
     if tactile_enc_type == "image":
         for tac_name in robot_cfg.tactiles:
-            tactile_img = step.get(f"observation.images.{tac_name}", None)
-            if tactile_img is not None:
-                tactile_signal = tactile_img[0, :, :].numpy()  # (H, W) shape, use first channel
-                tactile_signals[tac_name] = tactile_signal
+            if any(tac_name.startswith(p) for p in prefixs):
+                tactile_img = step.get(f"observation.images.{tac_name}", None)
+                if tactile_img is not None:
+                    tactile_signal = tactile_img[0, :, :].numpy()  # (H, W) shape, use first channel
+                    tactile_signals[tac_name] = tactile_signal
 
     elif tactile_enc_type == "state":
-        total_pixels = sum(h * w for c, h, w in robot_cfg.tactile_to_image_shape.values())
-        empty_data = np.zeros((total_pixels,), dtype=np.float32).reshape(2, -1)  # 2 channels -> {left_tactile, right_tactile}
+        total_pixels = sum([
+            h * w for tac_name, (c, h, w) in robot_cfg.tactile_to_image_shape.items()
+            if any(tac_name.startswith(p) for p in prefixs)
+        ])
+        empty_data = np.zeros((total_pixels,), dtype=np.float32).reshape(len(prefixs), -1)
 
         # Reconstruct raw tactile data from state
         start_idx = len(robot_cfg.motors)
         tactile_state = step["observation.state"][start_idx:]
         for i, (tac_name, pixel_indices) in enumerate(robot_cfg.tactile_to_state_indices.items()):
             tactile_data = tactile_state[i].item()
-            tac_channel = 0 if tac_name.startswith("left") else 1
+            tac_channel = 0 if tac_name.startswith(prefixs[0]) else 1
             empty_data[tac_channel, pixel_indices] = tactile_data
 
         # indexing and reshaping into images
         flatten_data = empty_data.flatten()
         idx = 0
         for tac_name, (channel, height, width) in robot_cfg.tactile_to_image_shape.items():
-            size = height * width
-            tactile_signal = flatten_data[idx:idx + size].reshape((height, width))
-            tactile_signals[tac_name] = tactile_signal
-            idx += size
+            if any(tac_name.startswith(p) for p in prefixs):
+                size = height * width
+                tactile_signal = flatten_data[idx:idx + size].reshape((height, width))
+                tactile_signals[tac_name] = tactile_signal
+                idx += size
 
     return tactile_signals
 
@@ -164,9 +174,7 @@ def visualize_tactile(robot_cfg: RobotConfig, tactile_enc_type: str, dataset: Le
                 tactile_signals = parse_tactile_signals(robot_cfg, tactile_enc_type, step)
 
                 # Process tactile data
-                for tac_name in tactile_names:
-                    tactile_data = tactile_signals[tac_name]
-
+                for tac_name, tactile_data in tactile_signals.items():
                     # Set value of heatmap
                     for r in range(tactile_data.shape[0]):
                         for c in range(tactile_data.shape[1]):
