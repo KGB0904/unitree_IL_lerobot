@@ -29,7 +29,7 @@ Features:
 - MLP-based VAE encoder and transformer replacement
 - Support for various input modalities (state, images, etc.)
 - Normalization and unnormalization
-- Action queue for multi-step action support
+- One-step action prediction (no action queue)
 """
 
 import torch
@@ -80,8 +80,7 @@ class MLPPolicy(PreTrainedPolicy):
     - CNN backbone for image feature extraction (like ACT)
     - MLP-based VAE encoder and transformer replacement
     - Input/output normalization and unnormalization
-    - MLP-based action prediction
-    - Action queue for multi-step action management
+    - MLP-based one-step action prediction (no action queue)
     - Checkpoint saving/loading
     """
 
