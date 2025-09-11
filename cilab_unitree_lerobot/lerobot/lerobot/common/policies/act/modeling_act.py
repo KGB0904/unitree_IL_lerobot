@@ -79,25 +79,32 @@ class ACTPolicy(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        # TODO(aliberts, rcadene): As of now, lr_backbone == lr
-        # Should we remove this and just `return self.parameters()`?
-        return [
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
-                ],
-                "lr": self.config.optimizer_lr_backbone,
-            },
+        # Original structure: backbone group is kept as is, tactile_backbone group is added as a separate group.
+        other_params = [
+            p
+            for n, p in self.named_parameters()
+            if not (n.startswith("model.backbone") or n.startswith("model.tactile_backbone"))
+            and p.requires_grad
         ]
+
+        backbone_params = [
+            p
+            for n, p in self.named_parameters()
+            if n.startswith("model.backbone") and p.requires_grad
+        ]
+
+        tactile_params = [
+            p
+            for n, p in self.named_parameters()
+            if n.startswith("model.tactile_backbone") and p.requires_grad
+        ]
+
+        param_groups = [{"params": other_params}]
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": self.config.optimizer_lr_backbone})
+        if tactile_params:
+            param_groups.append({"params": tactile_params, "lr": self.config.optimizer_lr_backbone})
+        return param_groups
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -337,10 +344,28 @@ class ACT(nn.Module):
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+            # Add small CNN for tactile (original camera path is kept).
+            if any("tactile" in key for key in self.config.image_features):
+                self.tactile_backbone = nn.Sequential(
+                    nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((8, 8)),
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((4, 4)),
+                    nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((2, 2)),
+                    nn.Conv2d(128, config.dim_model, kernel_size=1),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                )
+            else:
+                self.tactile_backbone = None
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -366,6 +391,8 @@ class ACT(nn.Module):
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
+            n_1d_tokens += 1
+        if self.config.image_features and any("tactile" in key for key in self.config.image_features):
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -470,24 +497,42 @@ class ACT(nn.Module):
             )
 
         # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
+        # 1) Build 1D tokens (latent, robot_state, env_state, tactile)
+        tokens_1d = [self.encoder_latent_input_proj(latent_sample)]
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
-        # Environment state token.
+            tokens_1d.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
         if self.config.env_state_feature:
-            encoder_in_tokens.append(
+            tokens_1d.append(
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
 
-        # Camera observation features and positional embeddings.
-        if self.config.image_features:
+        # Tactile 1D token (average over tactile views)
+        tactile_features_1d = []
+        if self.config.image_features and "observation.images" in batch and self.tactile_backbone is not None:
+            for img_key, img in zip(self.config.image_features, batch["observation.images"]):
+                if "tactile" in img_key:
+                    tac_feat = self.tactile_backbone(img).squeeze(-1).squeeze(-1)  # (B, D)
+                    tactile_features_1d.append(tac_feat)
+        if tactile_features_1d:
+            tactile_token = torch.stack(tactile_features_1d, dim=0).mean(0) if len(tactile_features_1d) > 1 else tactile_features_1d[0]
+            tokens_1d.append(tactile_token)
+
+        tokens_1d = torch.stack(tokens_1d, dim=0)  # (N1D, B, D)
+        pos_embed_1d = self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)  # (N1D, 1, D)
+
+        # 2) Build 2D camera tokens (exclude tactile) - original self.backbone path is kept
+        tokens_2d = None
+        pos_embed_2d = None
+        if (
+            self.config.image_features
+            and hasattr(self, "backbone")
+        ):
             all_cam_features = []
             all_cam_pos_embeds = []
-
-            # For a list of images, the H and W may vary but H*W is constant.
-            for img in batch["observation.images"]:
+            for img_key, img in zip(self.config.image_features, batch["observation.images"]):
+                if "tactile" in img_key:
+                    continue
+                
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -495,29 +540,31 @@ class ACT(nn.Module):
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-
                 all_cam_features.append(cam_features)
                 all_cam_pos_embeds.append(cam_pos_embed)
+            if all_cam_features:
+                tokens_2d = torch.cat(all_cam_features, dim=0)  # (NPIX, B, D)
+                pos_embed_2d = torch.cat(all_cam_pos_embeds, dim=0)  # (NPIX, B, D)
 
-            encoder_in_tokens.extend(torch.cat(all_cam_features, axis=0))
-            encoder_in_pos_embed.extend(torch.cat(all_cam_pos_embeds, axis=0))
-
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        # 3) Concatenate 1D and 2D tokens/positional embeddings along sequence dimension
+        if tokens_2d is not None and tokens_2d.numel() > 0:
+            encoder_tokens = torch.cat([tokens_1d, tokens_2d], dim=0)
+            encoder_pos = torch.cat([pos_embed_1d, pos_embed_2d], dim=0)
+        else:
+            encoder_tokens = tokens_1d
+            encoder_pos = pos_embed_1d
 
         # Forward pass through the transformer modules.
-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
-        # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+        encoder_out = self.encoder(encoder_tokens, pos_embed=encoder_pos)
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
-            dtype=encoder_in_pos_embed.dtype,
-            device=encoder_in_pos_embed.device,
+            dtype=encoder_pos.dtype,
+            device=encoder_pos.device,
         )
         decoder_out = self.decoder(
             decoder_in,
             encoder_out,
-            encoder_pos_embed=encoder_in_pos_embed,
+            encoder_pos_embed=encoder_pos,
             decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
         )
 
