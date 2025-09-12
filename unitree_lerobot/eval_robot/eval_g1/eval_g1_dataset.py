@@ -17,7 +17,7 @@ from torch import nn
 from contextlib import nullcontext
 from multiprocessing import Array, Lock
 
-from lerobot.common.policies.factory import make_policy
+from cilab_unitree_lerobot.lerobot.lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import (
     get_safe_torch_device,
     init_logging,
