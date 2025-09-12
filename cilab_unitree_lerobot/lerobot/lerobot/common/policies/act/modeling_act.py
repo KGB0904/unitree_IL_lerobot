@@ -346,23 +346,20 @@ class ACT(nn.Module):
             )
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
-            # Add small CNN for tactile (original camera path is kept).
+            # Add lightweight CNN for tactile (preserves 2D spatial information)
             if any("tactile" in key for key in self.config.image_features):
                 self.tactile_backbone = nn.Sequential(
                     nn.Conv2d(3, 32, kernel_size=3, padding=1),
                     nn.BatchNorm2d(32),
                     nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((8, 8)),
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),  # downsample but keep spatial
                     nn.BatchNorm2d(64),
                     nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((4, 4)),
                     nn.Conv2d(64, 128, kernel_size=3, padding=1),
                     nn.BatchNorm2d(128),
                     nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((2, 2)),
-                    nn.Conv2d(128, config.dim_model, kernel_size=1),
-                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Conv2d(128, config.dim_model, kernel_size=1),  # project to model dim
+                    # NO AdaptiveAvgPool2d((1,1)) - preserve spatial information!
                 )
             else:
                 self.tactile_backbone = None
@@ -392,8 +389,7 @@ class ACT(nn.Module):
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
-        if self.config.image_features and any("tactile" in key for key in self.config.image_features):
-            n_1d_tokens += 1
+        # Note: tactile is processed as 2D spatial tokens, not 1D
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -497,7 +493,7 @@ class ACT(nn.Module):
             )
 
         # Prepare transformer encoder inputs.
-        # 1) Build 1D tokens (latent, robot_state, env_state, tactile)
+        # 1) Build 1D tokens (latent, robot_state, env_state)
         tokens_1d = [self.encoder_latent_input_proj(latent_sample)]
         if self.config.robot_state_feature:
             tokens_1d.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
@@ -506,45 +502,43 @@ class ACT(nn.Module):
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
 
-        # Tactile 1D token (average over tactile views)
-        tactile_features_1d = []
-        if self.config.image_features and "observation.images" in batch and self.tactile_backbone is not None:
-            for img_key, img in zip(self.config.image_features, batch["observation.images"]):
-                if "tactile" in img_key:
-                    tac_feat = self.tactile_backbone(img).squeeze(-1).squeeze(-1)  # (B, D)
-                    tactile_features_1d.append(tac_feat)
-        if tactile_features_1d:
-            tactile_token = torch.stack(tactile_features_1d, dim=0).mean(0) if len(tactile_features_1d) > 1 else tactile_features_1d[0]
-            tokens_1d.append(tactile_token)
-
         tokens_1d = torch.stack(tokens_1d, dim=0)  # (N1D, B, D)
         pos_embed_1d = self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)  # (N1D, 1, D)
 
-        # 2) Build 2D camera tokens (exclude tactile) - original self.backbone path is kept
+        # 2) Build 2D spatial tokens (camera + tactile) - preserve spatial information
         tokens_2d = None
         pos_embed_2d = None
-        if (
-            self.config.image_features
-            and hasattr(self, "backbone")
-        ):
-            all_cam_features = []
-            all_cam_pos_embeds = []
+        if self.config.image_features and "observation.images" in batch:
+            all_2d_features = []
+            all_2d_pos_embeds = []
+            
             for img_key, img in zip(self.config.image_features, batch["observation.images"]):
-                if "tactile" in img_key:
-                    continue
-                
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                if "tactile" in img_key and self.tactile_backbone is not None:
+                    # Process tactile as 2D spatial tokens (preserve spatial information)
+                    tac_features = self.tactile_backbone(img)  # (B, D, H', W')
+                    tac_pos_embed = self.encoder_cam_feat_pos_embed(tac_features).to(dtype=tac_features.dtype)
+                    
+                    # Rearrange to sequence format
+                    tac_features = einops.rearrange(tac_features, "b c h w -> (h w) b c")
+                    tac_pos_embed = einops.rearrange(tac_pos_embed, "b c h w -> (h w) b c")
+                    all_2d_features.append(tac_features)
+                    all_2d_pos_embeds.append(tac_pos_embed)
+                    
+                elif "tactile" not in img_key and hasattr(self, "backbone"):
+                    # Process camera as 2D spatial tokens (original path)
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-                all_cam_features.append(cam_features)
-                all_cam_pos_embeds.append(cam_pos_embed)
-            if all_cam_features:
-                tokens_2d = torch.cat(all_cam_features, dim=0)  # (NPIX, B, D)
-                pos_embed_2d = torch.cat(all_cam_pos_embeds, dim=0)  # (NPIX, B, D)
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    all_2d_features.append(cam_features)
+                    all_2d_pos_embeds.append(cam_pos_embed)
+                    
+            if all_2d_features:
+                tokens_2d = torch.cat(all_2d_features, dim=0)  # (NPIX_total, B, D)
+                pos_embed_2d = torch.cat(all_2d_pos_embeds, dim=0)  # (NPIX_total, B, D)
 
         # 3) Concatenate 1D and 2D tokens/positional embeddings along sequence dimension
         if tokens_2d is not None and tokens_2d.numel() > 0:
