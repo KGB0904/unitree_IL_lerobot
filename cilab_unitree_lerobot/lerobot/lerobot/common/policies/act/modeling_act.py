@@ -346,23 +346,19 @@ class ACT(nn.Module):
             )
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
-            # Add small CNN for tactile (original camera path is kept).
+            # Add ResNet18 for tactile (original camera path is kept).
             if any("tactile" in key for key in self.config.image_features):
+                tactile_resnet = torchvision.models.resnet18(
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d
+                )
+                # Remove the final fully connected layer and avgpool
+                tactile_resnet = nn.Sequential(*list(tactile_resnet.children())[:-2])
+                
                 self.tactile_backbone = nn.Sequential(
-                    nn.Conv2d(3, 32, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(32),
-                    nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((8, 8)),
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((4, 4)),
-                    nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(128),
-                    nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((2, 2)),
-                    nn.Conv2d(128, config.dim_model, kernel_size=1),
+                    tactile_resnet,
                     nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Conv2d(512, config.dim_model, kernel_size=1),  # ResNet18 has 512 output channels
                 )
             else:
                 self.tactile_backbone = None
