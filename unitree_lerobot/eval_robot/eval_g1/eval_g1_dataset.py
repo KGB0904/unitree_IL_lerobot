@@ -3,7 +3,7 @@ Refer to:   lerobot/lerobot/scripts/eval.py
             lerobot/lerobot/scripts/econtrol_robot.py
             lerobot/common/robot_devices/control_utils.py
 '''
-
+import os
 import torch
 import tqdm
 import logging
@@ -32,6 +32,7 @@ from unitree_lerobot.eval_robot.eval_g1.eval_real_config import EvalRealConfig
 
 from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 
+from unitree_lerobot.eval_robot.eval_g1.eval_utils import save_eval_results, calculate_eval_metrics
 
 # copy from lerobot.common.robot_devices.control_utils import predict_action
 def predict_action(observation, policy, device, use_amp):
@@ -59,6 +60,7 @@ def predict_action(observation, policy, device, use_amp):
         action = action.to("cpu")
 
     return action
+
 
 
 def eval_policy(
@@ -134,7 +136,14 @@ def eval_policy(
             pass
 
     #===============init robot=====================
-    user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
+    # Check if running in automated mode (e.g., from eval_g1_datasets.py)
+    auto_mode = os.getenv('EVAL_AUTO_MODE', 'false').lower() == 'true'
+    if auto_mode:
+        user_input = 's'  # Automatically start
+        print("Auto mode: Starting evaluation automatically")
+    else:
+        user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
+    
     if user_input.lower() == 's':
 
         if eval_config['send_real_robot']:
@@ -216,6 +225,9 @@ def eval_policy(
 
         time.sleep(1)
         plt.savefig('figure.png')
+        
+        # Calculate evaluation metrics
+        return calculate_eval_metrics(ground_truth_actions, predicted_actions)
 
 
 @parser.wrap()
@@ -239,7 +251,14 @@ def eval_main(cfg: EvalRealConfig):
     policy.eval()
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        eval_policy(policy, dataset)
+        results = eval_policy(policy, dataset)
+        
+        # Save results to JSON file for eval_g1_datasets.py to collect
+        output_file = os.getenv('EVAL_OUTPUT_FILE') or getattr(cfg, 'output_file', None)
+        if results and output_file:
+            save_eval_results(results, output_file)
+        
+        return results
 
     logging.info("End of eval")
 

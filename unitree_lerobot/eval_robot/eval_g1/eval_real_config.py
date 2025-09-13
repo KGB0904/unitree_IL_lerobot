@@ -13,6 +13,7 @@ from lerobot.configs.policies import PreTrainedConfig
 class EvalRealConfig:
     repo_id: str
     policy: PreTrainedConfig | None = None
+    output_file: str | None = None
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
