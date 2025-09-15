@@ -93,8 +93,13 @@ def eval_policy(
     step = dataset[from_idx]
     to_idx = dataset.episode_data_index["to"][0].item()
 
-    camera_names = robot_config.cameras
-    tactile_names = getattr(robot_config, "tactiles", [])
+    # Extract actual available image keys from dataset instead of using robot_config
+    available_image_keys = [key for key in step.keys() if key.startswith("observation.images.")]
+    camera_names = [key.replace("observation.images.", "") for key in available_image_keys if "tactile" not in key]
+    tactile_names = [key.replace("observation.images.", "") for key in available_image_keys if "tactile" in key]
+    
+    print(f"Available cameras: {camera_names}")
+    print(f"Available tactiles: {tactile_names}")
     ground_truth_actions = []
     predicted_actions = []
 
@@ -163,11 +168,19 @@ def eval_policy(
             observation = {}
 
             for cam_name in camera_names:
-                observation[f"observation.images.{cam_name}"] = step[f"observation.images.{cam_name}"]
+                cam_key = f"observation.images.{cam_name}"
+                if cam_key in step:
+                    observation[cam_key] = step[cam_key]
+                else:
+                    print(f"Warning: Camera {cam_name} not found in dataset, skipping...")
             observation["observation.state"] = step["observation.state"]
             for tac_name in tactile_names:
                 if eval_config["tactile_enc_type"] == "image":
-                    observation[f"observation.images.{tac_name}"] = step[f"observation.images.{tac_name}"]
+                    tac_key = f"observation.images.{tac_name}"
+                    if tac_key in step:
+                        observation[tac_key] = step[tac_key]
+                    else:
+                        print(f"Warning: Tactile {tac_name} not found in dataset, skipping...")
                 elif eval_config["tactile_enc_type"] == "state":
                     observation["observation.state"] = torch.cat(
                         [
@@ -242,7 +255,7 @@ def eval_main(cfg: EvalRealConfig):
 
     logging.info("Making policy.")
 
-    dataset = LeRobotDataset(repo_id = cfg.repo_id)
+    dataset = LeRobotDataset(repo_id = cfg.repo_id, video_backend="pyav")
 
     policy = make_policy(
         cfg=cfg.policy,
