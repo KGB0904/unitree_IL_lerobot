@@ -4,18 +4,24 @@ Refer to:   lerobot/lerobot/scripts/eval.py
             lerobot/common/robot_devices/control_utils.py
 '''
 
+import json
+import logging
+import shutil
+import time
+from collections import OrderedDict
+from contextlib import nullcontext
+from copy import copy
+from dataclasses import asdict
+from multiprocessing import Array, Lock
+from pathlib import Path
+from pprint import pformat
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import tqdm
-import logging
-import time
-import numpy as np
-import matplotlib.pyplot as plt
-from copy import copy
-from pprint import pformat
-from dataclasses import asdict
 from torch import nn
-from contextlib import nullcontext
-from multiprocessing import Array, Lock
 
 from cilab_unitree_lerobot.lerobot.lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import (
@@ -61,6 +67,59 @@ def predict_action(observation, policy, device, use_amp):
     return action
 
 
+def get_motor_slices(eval_config) -> OrderedDict:
+    arm_type = eval_config.get("arm_type")
+    hand_type = eval_config.get("hand_type")
+
+    if arm_type == "g1":
+        if hand_type == "inspire":
+            return OrderedDict(
+                [
+                    ("left_arm", slice(0, 7)),
+                    ("left_hand", slice(7, 13)),
+                    ("right_arm", slice(13, 20)),
+                    ("right_hand", slice(20, 26)),
+                ]
+            )
+        if hand_type == "dex3":
+            return OrderedDict(
+                [
+                    ("left_arm", slice(0, 7)),
+                    ("right_arm", slice(7, 14)),
+                    ("left_hand", slice(14, 21)),
+                    ("right_hand", slice(21, 28)),
+                ]
+            )
+        if hand_type == "gripper":
+            return OrderedDict(
+                [
+                    ("left_arm", slice(0, 7)),
+                    ("right_arm", slice(7, 14)),
+                    ("left_hand", slice(14, 15)),
+                    ("right_hand", slice(15, 16)),
+                ]
+            )
+
+    raise NotImplementedError(
+        f"Unsupported motor slice configuration for arm_type={arm_type}, hand_type={hand_type}"
+    )
+
+
+def slice_array(array: np.ndarray, slc: slice) -> np.ndarray:
+    start = slc.start or 0
+    stop = slc.stop if slc.stop is not None else len(array)
+    if start >= len(array):
+        return array[0:0]
+    stop = min(stop, len(array))
+    return array[start:stop]
+
+
+def tensor_to_numpy(value) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
 def eval_policy(
     policy: torch.nn.Module,
     dataset: LeRobotDataset,
@@ -95,6 +154,42 @@ def eval_policy(
     tactile_names = getattr(robot_config, "tactiles", [])
     ground_truth_actions = []
     predicted_actions = []
+    samples = []
+
+    motor_slices = get_motor_slices(eval_config)
+    frequency = 50.0
+
+    image_key_to_color = {v: k for k, v in robot_config.camera_to_image_key.items()}
+
+    output_root = Path("eval_outputs")
+    output_root.mkdir(parents=True, exist_ok=True)
+    episode_idx = 0
+    episode_dir = output_root / f"episode_{episode_idx:04d}"
+    if episode_dir.exists():
+        shutil.rmtree(episode_dir)
+    episode_dir.mkdir(parents=True, exist_ok=True)
+
+    colors_dir = episode_dir / "colors"
+    colors_dir.mkdir(parents=True, exist_ok=True)
+
+    tactiles_dir = episode_dir / "tactiles" if tactile_names else None
+    if tactiles_dir is not None:
+        tactiles_dir.mkdir(parents=True, exist_ok=True)
+
+    has_carpet_tactiles = any(name.startswith("carpet") for name in tactile_names)
+    carpet_dir = episode_dir / "carpet_tactiles" if has_carpet_tactiles else None
+    if carpet_dir is not None:
+        carpet_dir.mkdir(parents=True, exist_ok=True)
+
+    for cam_name in camera_names:
+        color_key = image_key_to_color.get(cam_name, cam_name)
+        (colors_dir / color_key).mkdir(parents=True, exist_ok=True)
+
+    if tactiles_dir is not None:
+        for tactile_name in tactile_names:
+            if tactile_name.startswith("carpet"):
+                continue
+            (tactiles_dir / tactile_name).mkdir(parents=True, exist_ok=True)
 
     if eval_config['send_real_robot']:
         # arm
@@ -147,8 +242,6 @@ def eval_policy(
             print("wait robot to pose")
             time.sleep(1)
 
-        frequency = 50.0
-
         for step_idx in tqdm.tqdm(range(from_idx, to_idx)):
             step = dataset[step_idx]
             observation = {}
@@ -174,8 +267,102 @@ def eval_policy(
 
             action = action.cpu().numpy()
 
-            ground_truth_actions.append(step["action"].numpy())
+            ground_truth_action = tensor_to_numpy(step["action"])
+            state_vector = tensor_to_numpy(step["observation.state"])
+
+            ground_truth_actions.append(ground_truth_action)
             predicted_actions.append(action)
+
+            frame_idx = step_idx - from_idx
+            sample = {
+                "timestamp": float(frame_idx) / frequency,
+                "states": {},
+                "actions": {},
+                "predicted_actions": {},
+                "colors": {},
+                "tactiles": {},
+                "carpet_tactiles": {},
+            }
+
+            for part_name, part_slice in motor_slices.items():
+                sliced_state = slice_array(state_vector, part_slice)
+                sliced_gt = slice_array(ground_truth_action, part_slice)
+                sliced_pred = slice_array(action, part_slice)
+                sample["states"][part_name] = {"qpos": sliced_state.tolist()}
+                sample["actions"][part_name] = {"qpos": sliced_gt.tolist()}
+                sample["predicted_actions"][part_name] = {"qpos": sliced_pred.tolist()}
+
+            for cam_name in camera_names:
+                obs_key = f"observation.images.{cam_name}"
+                if obs_key not in step:
+                    continue
+
+                img_tensor = step[obs_key]
+                image_np = tensor_to_numpy(img_tensor)
+                if image_np.ndim == 3 and image_np.shape[0] in {1, 3, 4}:
+                    image_np = np.transpose(image_np, (1, 2, 0))
+                if image_np.ndim == 2:
+                    image_np = image_np[:, :, None]
+                if image_np.dtype != np.uint8:
+                    image_np = np.clip(image_np, 0.0, 1.0)
+                    image_np = (image_np * 255).astype(np.uint8)
+                if image_np.shape[-1] == 4:
+                    image_np = image_np[..., :3]
+                if image_np.shape[-1] == 1:
+                    image_np = np.repeat(image_np, 3, axis=-1)
+                bgr_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR) if image_np.shape[-1] == 3 else image_np
+                color_key = image_key_to_color.get(cam_name, cam_name)
+                image_filename = f"{frame_idx:06d}.png"
+                image_path = colors_dir / color_key / image_filename
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(image_path), bgr_image)
+                sample["colors"][color_key] = (Path("colors") / color_key / image_filename).as_posix()
+
+            if eval_config["tactile_enc_type"] == "image":
+                for tactile_name in tactile_names:
+                    obs_key = f"observation.images.{tactile_name}"
+                    if obs_key not in step:
+                        continue
+
+                    tactile_tensor = step[obs_key]
+                    tactile_np = tensor_to_numpy(tactile_tensor)
+                    if tactile_np.ndim == 3 and tactile_np.shape[0] in {1, 3, 4}:
+                        tactile_np = np.transpose(tactile_np, (1, 2, 0))
+                    tactile_np = np.asarray(tactile_np)
+
+                    if tactile_name.startswith("carpet"):
+                        if carpet_dir is None:
+                            continue
+                        tactile_filename = f"{tactile_name}_{frame_idx:06d}.npy"
+                        tactile_path = carpet_dir / tactile_filename
+                        np.save(tactile_path, tactile_np)
+                        sample["carpet_tactiles"][tactile_name] = (
+                            Path("carpet_tactiles") / tactile_filename
+                        ).as_posix()
+                    else:
+                        if tactiles_dir is None:
+                            continue
+                        tactile_filename = f"{frame_idx:06d}.npy"
+                        tactile_path = tactiles_dir / tactile_name / tactile_filename
+                        tactile_path.parent.mkdir(parents=True, exist_ok=True)
+                        np.save(tactile_path, tactile_np)
+                        sample["tactiles"][tactile_name] = (
+                            Path("tactiles") / tactile_name / tactile_filename
+                        ).as_posix()
+            elif eval_config["tactile_enc_type"] == "state":
+                for tactile_name in tactile_names:
+                    state_key = f"observation.state.{tactile_name}"
+                    if state_key not in step:
+                        continue
+
+                    tactile_state = tensor_to_numpy(step[state_key])
+                    sample["states"][tactile_name] = {"qpos": tactile_state.tolist()}
+            else:
+                raise NotImplementedError(
+                    f"Unsupported tactile encoding: {eval_config['tactile_enc_type']}"
+                )
+
+            samples.append(sample)
 
             if eval_config['send_real_robot']:
                 # exec action
@@ -188,9 +375,18 @@ def eval_policy(
                     right_hand_array[:] = action[15]
             
                 time.sleep(1/frequency)
-        
+
         ground_truth_actions = np.array(ground_truth_actions)
         predicted_actions = np.array(predicted_actions)
+
+        episode_dict = {
+            "text": {"goal": getattr(dataset, "meta", {}).get("task", "")},
+            "metadata": {"frequency": frequency},
+            "data": samples,
+        }
+
+        with (episode_dir / "data.json").open("w", encoding="utf-8") as json_file:
+            json.dump(episode_dict, json_file, indent=2)
 
         # Get the number of timesteps and action dimensions
         n_timesteps, n_dims = ground_truth_actions.shape
@@ -216,6 +412,7 @@ def eval_policy(
 
         time.sleep(1)
         plt.savefig('figure.png')
+        plt.close(fig)
 
 
 @parser.wrap()
